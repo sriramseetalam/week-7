@@ -1,0 +1,135 @@
+CREATE PROCEDURE Handle_SCD_Upsert
+    @SCDType INT,             
+    @CustomerID INT,
+    @Name NVARCHAR(100),
+    @City NVARCHAR(100)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @Now DATETIME = GETDATE();
+    DECLARE @OldCity NVARCHAR(100);
+
+    -- SCD Type 0: No update, insert only if not exists
+    IF @SCDType = 0
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM Customer WHERE CustomerID = @CustomerID)
+        BEGIN
+            INSERT INTO Customer (CustomerID, Name, City)
+            VALUES (@CustomerID, @Name, @City);
+        END
+    END
+
+    -- SCD Type 1: Overwrite old data
+    ELSE IF @SCDType = 1
+    BEGIN
+        IF EXISTS (SELECT 1 FROM Customer WHERE CustomerID = @CustomerID)
+        BEGIN
+            UPDATE Customer
+            SET Name = @Name, City = @City
+            WHERE CustomerID = @CustomerID;
+        END
+        ELSE
+        BEGIN
+            INSERT INTO Customer (CustomerID, Name, City)
+            VALUES (@CustomerID, @Name, @City);
+        END
+    END
+
+    -- SCD Type 2: Add new row with versioning
+    ELSE IF @SCDType = 2
+    BEGIN
+        IF EXISTS (
+            SELECT 1 FROM Customer 
+            WHERE CustomerID = @CustomerID AND CurrentFlag = 1 
+                  AND (Name != @Name OR City != @City)
+        )
+        BEGIN
+            UPDATE Customer
+            SET EndDate = @Now, CurrentFlag = 0
+            WHERE CustomerID = @CustomerID AND CurrentFlag = 1;
+
+            INSERT INTO Customer (CustomerID, Name, City, StartDate, EndDate, CurrentFlag)
+            VALUES (@CustomerID, @Name, @City, @Now, NULL, 1);
+        END
+        ELSE IF NOT EXISTS (SELECT 1 FROM Customer WHERE CustomerID = @CustomerID)
+        BEGIN
+            INSERT INTO Customer (CustomerID, Name, City, StartDate, EndDate, CurrentFlag)
+            VALUES (@CustomerID, @Name, @City, @Now, NULL, 1);
+        END
+    END
+
+    -- SCD Type 3: Track previous value in same row
+    ELSE IF @SCDType = 3
+    BEGIN
+        IF EXISTS (SELECT 1 FROM Customer WHERE CustomerID = @CustomerID)
+        BEGIN
+            SELECT @OldCity = City FROM Customer WHERE CustomerID = @CustomerID;
+
+            IF @OldCity != @City
+            BEGIN
+                UPDATE Customer
+                SET PreviousCity = City, City = @City, Name = @Name
+                WHERE CustomerID = @CustomerID;
+            END
+            ELSE
+            BEGIN
+                UPDATE Customer SET Name = @Name WHERE CustomerID = @CustomerID;
+            END
+        END
+        ELSE
+        BEGIN
+            INSERT INTO Customer (CustomerID, Name, City, PreviousCity)
+            VALUES (@CustomerID, @Name, @City, NULL);
+        END
+    END
+
+    -- SCD Type 4: Use a separate history table
+    ELSE IF @SCDType = 4
+    BEGIN
+        IF EXISTS (SELECT 1 FROM Customer WHERE CustomerID = @CustomerID)
+        BEGIN
+            INSERT INTO CustomerHistory (CustomerID, Name, City, ChangeDate)
+            SELECT CustomerID, Name, City, @Now
+            FROM Customer
+            WHERE CustomerID = @CustomerID;
+
+            UPDATE Customer
+            SET Name = @Name, City = @City
+            WHERE CustomerID = @CustomerID;
+        END
+        ELSE
+        BEGIN
+            INSERT INTO Customer (CustomerID, Name, City)
+            VALUES (@CustomerID, @Name, @City);
+        END
+    END
+
+    -- SCD Type 6: Combine Types 1, 2, and 3
+    ELSE IF @SCDType = 6
+    BEGIN
+        SELECT @OldCity = City 
+        FROM Customer 
+        WHERE CustomerID = @CustomerID AND CurrentFlag = 1;
+
+        IF EXISTS (
+            SELECT 1 FROM Customer 
+            WHERE CustomerID = @CustomerID AND CurrentFlag = 1 
+                  AND (Name != @Name OR City != @City)
+        )
+        BEGIN
+            -- Expire current row
+            UPDATE Customer
+            SET EndDate = @Now, CurrentFlag = 0
+            WHERE CustomerID = @CustomerID AND CurrentFlag = 1;
+
+            -- Insert new row with historical City
+            INSERT INTO Customer (CustomerID, Name, City, PreviousCity, StartDate, EndDate, CurrentFlag)
+            VALUES (@CustomerID, @Name, @City, @OldCity, @Now, NULL, 1);
+        END
+        ELSE IF NOT EXISTS (SELECT 1 FROM Customer WHERE CustomerID = @CustomerID)
+        BEGIN
+            INSERT INTO Customer (CustomerID, Name, City, PreviousCity, StartDate, EndDate, CurrentFlag)
+            VALUES (@CustomerID, @Name, @City, NULL, @Now, NULL, 1);
+        END
+    END
+END
